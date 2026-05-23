@@ -319,7 +319,17 @@ if menu == "📝 快速記帳 & AI建議":
 
         with col_upload:
             if is_mobile:
-                uploaded_file = st.camera_input("📷 拍照", label_visibility="collapsed", key="quick_cam")
+                # 只有當使用者點擊圖示後才顯示相機
+                if st.session_state.get("show_camera", False):
+                    uploaded_file = st.camera_input("📷 拍照", label_visibility="collapsed", key="quick_cam")
+                    if st.button("❌ 關閉相機", key="close_cam"):
+                        st.session_state.show_camera = False
+                        st.rerun()
+                else:
+                    if st.button("📷", use_container_width=True, help="點擊開啟相機拍照"):
+                        st.session_state.show_camera = True
+                        st.rerun()
+                    uploaded_file = None
             else:
                 uploaded_file = st.file_uploader(
                     "📷 上傳收據 (選填)",
@@ -343,6 +353,8 @@ if menu == "📝 快速記帳 & AI建議":
                 result = analyze_with_gemini(text_content=text_input, image_content=img_bytes)
                 if result:
                     st.session_state.result = result
+                    # 辨識成功後自動關閉相機畫面
+                    st.session_state.show_camera = False
                 else:
                     st.warning("辨識結果為空，請稍後再試。")
         else:
@@ -393,6 +405,7 @@ if menu == "📝 快速記帳 & AI建議":
                 }
                 save_to_sheets(final_data)
                 st.success("已存入 Google Sheets！")
+                st.session_state.show_camera = False
                 del st.session_state.result
                 st.rerun()
 

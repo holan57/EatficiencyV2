@@ -1,0 +1,12 @@
+# Secrets and Environment
+.env
+*.json
+
+# Python
+__pycache__/
+*.pyc
+
+# Temporary files
+testVersion/
+SecretsFiles/
+.streamlit/
