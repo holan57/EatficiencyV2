@@ -319,15 +319,21 @@ if menu == "📝 快速記帳 & AI建議":
 
         with col_upload:
             if is_mobile:
-                # 只有當使用者點擊圖示後才顯示相機
-                if st.session_state.get("show_camera", False):
-                    uploaded_file = st.camera_input("📷 拍照", label_visibility="collapsed", key="quick_cam")
-                    if st.button("❌ 關閉相機", key="close_cam"):
+                # 行動端：預設只顯示相機圖示按鈕
+                if not st.session_state.get("show_camera", False):
+                    if st.button("📷", use_container_width=True, help="點擊拍照或上傳"):
+                        st.session_state.show_camera = True
+                        st.rerun()
+                    uploaded_file = st.session_state.get("temp_img_bytes", None)
+                else:
+                    # 點擊後顯示上傳組件（手機上會彈出拍照/相簿選單）
+                    mobile_file = st.file_uploader("選取動作", type=['jpg', 'jpeg', 'png'], key="mob_up")
+                    if mobile_file:
+                        st.session_state.temp_img_bytes = mobile_file.getvalue()
                         st.session_state.show_camera = False
                         st.rerun()
-                else:
-                    if st.button("📷", use_container_width=True, help="點擊開啟相機拍照"):
-                        st.session_state.show_camera = True
+                    if st.button("取消", key="cancel_cam"):
+                        st.session_state.show_camera = False
                         st.rerun()
                     uploaded_file = None
             else:
@@ -406,6 +412,7 @@ if menu == "📝 快速記帳 & AI建議":
                 save_to_sheets(final_data)
                 st.success("已存入 Google Sheets！")
                 st.session_state.show_camera = False
+                st.session_state.temp_img_bytes = None # 清除暫存圖片
                 del st.session_state.result
                 st.rerun()
 
