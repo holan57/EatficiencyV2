@@ -1,0 +1,5 @@
+streamlit
+st-gsheets-connection
+pandas
+google-genai
+streamlit_javascript
