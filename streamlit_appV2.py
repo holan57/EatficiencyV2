@@ -58,11 +58,34 @@ def show_advice_modal(advice_text):
 # --- Google Sheets 連線 ---
 conn = st.connection("gsheets", type=GSheetsConnection)
 
+def get_users():
+    """讀取使用者資料"""
+    try:
+        return conn.read(worksheet="User_Data", ttl=0)
+    except Exception:
+        return pd.DataFrame(columns=["user_name"])
+
+def add_user(name):
+    """新增使用者"""
+    df = get_users()
+    if name not in df['user_name'].values:
+        new_row = pd.DataFrame([{"user_name": name}])
+        updated_df = pd.concat([df, new_row], ignore_index=True)
+        conn.update(worksheet="User_Data", data=updated_df)
+        st.cache_data.clear()
+
+def get_ref_data():
+    """讀取參考資料以提升辨識率"""
+    try:
+        return conn.read(worksheet="Ref_data", ttl=3600)
+    except Exception:
+        return pd.DataFrame()
+
 @st.cache_data(ttl=300)  # 快取 5 分鐘，避免頻繁讀取 Sheets
 def get_expenses():
     """從 Google Sheets 讀取資料"""
     try:
-        df = conn.read(ttl=0)
+        df = conn.read(worksheet="History_record", ttl=0)
         if df is None or df.empty:
             return pd.DataFrame(columns=["user_name", "date", "foodname", "amount", "category", "calories", "health_score", "advice"])
         return df
@@ -75,129 +98,54 @@ def save_to_sheets(new_data):
     df = get_expenses()
     new_row = pd.DataFrame([new_data])
     updated_df = pd.concat([df, new_row], ignore_index=True)
-    conn.update(data=updated_df)
+    conn.update(worksheet="History_record", data=updated_df)
     st.cache_data.clear()  # 存檔後清除快取，確保下次讀取到最新資料
 
-def analyze_with_gemini(text_content=None, image_content=None):
-    """使用 Gemini 分析文字與圖片"""
-    today = datetime.now().strftime('%Y-%m-%d')
-    base_prompt = f"""
-    今天是 {today}。
-    你是一個精準的飲食記帳與健康理財助手。
-    請分析使用者提供的【圖片】或【文字描述】：
-    【核心任務】：
-     辨識【食物名稱】、【熱量】、【金額】、【分類】。
-     估算【健康度評分】(0-10) 與【建議】。
-     格式必須是「純 JSON」，**嚴禁**包含任何 Markdown 標記（如 ```json）、反引號或解釋性文字。
-      【JSON 格式需求】：
-      {{
-        "date": "{today}",
-        "foodname": "...",
-        "amount": 0,
-        "category": "中式",
-        "calories": 0,
-        "health_score": 0,
-        "advice": "..."
-      }}
-
-      若無法辨識任何資訊，請在 JSON 對應欄位填入 null，不要回傳錯誤訊息。
-      """
-    
-    try:
-        contents = [base_prompt]
-        if image_content:
-            contents.append(types.Part.from_bytes(data=image_content, mime_type='image/jpeg'))
-        if text_content:
-            contents.append(f"\n\n額外文字資訊：{text_content}")
-
-        response = client.models.generate_content(
-            model=MODEL_NAME,
-            contents=contents
-        )
-        
-        text = response.text.strip()
-        clean_text = text.replace('```json', '').replace('```', '')
-        return json.loads(clean_text)
-    except Exception as e:
-        st.error(f"AI 辨識失敗: {e}")
-        return None
-
-# --- AI 建議引擎 (快取版) ---
-@st.cache_data(ttl=3600)  # 快取一小時
-def get_overall_advice(cache_key, GOOGLE_API_KEY, df_json):
+def analyze_with_gemini(text_content=None, image_content=None, ref_data=None):
     """
-    使用 Gemini 產生全域飲食與理財建議，快取以減少 API 調用。
+    單筆消費辨識：將文字或圖片轉換為記帳格式
     """
-    try:
-        df = pd.read_json(df_json)
-    except Exception:
-        df = pd.DataFrame()
-        
-    if df.empty:
-        return {
-            "summary": "尚未有記帳資料，開始記錄您的第一筆飲食消費吧！",
-            "reason": "當您開始輸入記帳資訊後，AI 會自動分析您的飲食偏好、健康度以及預算使用率，為您量身打造飲食與財務省錢建議。"
-        }
-        
-    # 計算預算統計與消費現狀
-    total_spent = pd.to_numeric(df['amount'], errors='coerce').fillna(0).astype(int).sum()
-    monthly_budget = st.secrets.get("MONTHLY_BUDGET", 15000)
-    budget_usage_pct = (total_spent / monthly_budget) * 100 if monthly_budget > 0 else 0
-    
-    # 處理時間戳與空值以利 JSON 序列化
-    df_recent = df.tail(10).copy()
-    for col in df_recent.columns:
-        df_recent[col] = df_recent[col].apply(lambda x: x.strftime('%Y-%m-%d') if hasattr(x, 'strftime') else x)
-    df_recent = df_recent.where(pd.notnull(df_recent), None)
-    recent_records = df_recent.to_dict(orient="records")
-    
-    category_counts = df['category'].value_counts().to_dict()
-    avg_health = pd.to_numeric(df['health_score'], errors='coerce').mean() if 'health_score' in df.columns else 0
-    avg_calories = pd.to_numeric(df['calories'], errors='coerce').mean() if 'calories' in df.columns else 0
+    ref_str = ref_data.to_string(index=False) if ref_data is not None and not ref_data.empty else "無"
     
     prompt = f"""
-    你是一個精準的飲食記帳與健康理財分析師。
-    請分析使用者的餐飲記帳數據，給予一小段精準的【預算與健康雙重建議】，並提供【詳細分析理由】。
-
-    【當前財務/飲食狀態】：
-    - 本月總預算：{monthly_budget} 元
-    - 本月已花費：{total_spent} 元
-    - 預算使用率：{budget_usage_pct:.1f}%
-    - 近期平均飲食健康度 (0-10)：{avg_health:.1f} 分
-    - 近期平均單餐估算熱量：{avg_calories:.1f} kcal
-    - 常用食物分類統計：{category_counts}
-
-    【最近 10 筆明細】：
-    {json.dumps(recent_records, ensure_ascii=False, indent=2)}
-
-    【核心任務】：
-    1. 產出一句簡短的總結建議 (summary)，長度在 30-50 字之間，必須直接點出財務或飲食的關鍵現狀（例如預算百分比、外食頻率等）。
-    2. 產出詳細的理由與具體建議 (reason)，長度在 100-200 字之間，分析分類佔比、熱量與省錢方向。
-    
-    【回傳格式】：
-    必須是「純 JSON」格式，**嚴禁**包含任何 Markdown 標記（如 ```json）、反引號或解釋性文字。
-    
-    【JSON 格式需求】：
-    {{
-      "summary": "您的總結建議內容...",
-      "reason": "您的詳細理由內容..."
-    }}
+    分析以下食物資料：{text_content or "請分析圖片"}
+    參考清單：{ref_str}
     """
     
-    try:
-        advice_client = genai.Client(api_key=GOOGLE_API_KEY)
-        response = advice_client.models.generate_content(
-            model='gemini-2.5-flash-lite',
-            contents=[prompt]
-        )
-        text = response.text.strip()
-        clean_text = text.replace('```json', '').replace('```', '')
-        return json.loads(clean_text)
-    except Exception as e:
-        return {
-            "summary": "AI 建議生成暫時不可用，但您可以照常記帳。",
-            "reason": f"錯誤原因: {e}"
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=[prompt] + ([types.Part.from_bytes(data=image_content, mime_type='image/jpeg')] if image_content else []),
+        config={
+            "response_mime_type": "application/json",
+            "system_instruction": "你是一個飲食記帳專家。請分析資料並回傳 JSON 格式：{\"date\":\"YYYY-MM-DD\", \"foodname\":\"品名\", \"amount\":金額, \"category\":\"中式/西式/日式/其他\", \"calories\":熱量, \"health_score\":1-10, \"advice\":\"健康建議\"}"
         }
+    )
+    return json.loads(response.text)
+
+@st.cache_data(ttl=3600)
+def get_overall_advice(cache_key, google_key, df_json):
+    """
+    整體建議分析：根據歷史紀錄提供理財與飲食建議
+    """
+    prompt = f"請分析以下使用者的歷史飲食與消費紀錄，並提供專業的理財與健康建議：{df_json}"
+    
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=[prompt],
+        config={
+            "response_mime_type": "application/json",
+            "system_instruction": """
+            你是一個結合營養學與財務管理的專家。
+            請針對數據分析趨勢，回傳 JSON：
+            {
+              "analysis": {
+                "summary": "一句話總結建議",
+                "reason": "詳細的分析理由與改善方向"
+              }
+            }"""
+        }
+    )
+    return json.loads(response.text)
 
 @st.fragment
 def render_ai_advice_section(df_all, google_key):
@@ -211,21 +159,25 @@ def render_ai_advice_section(df_all, google_key):
     with st.spinner("AI 正在分析您的數據..."):
         ai_advice = get_overall_advice(cache_key, google_key, df_json)
 
+    # 修正：從字典中正確提取 summary (原本嵌套在 analysis 內)
+    display_summary = ai_advice.get('analysis', {}).get('summary') if 'analysis' in ai_advice else ai_advice.get('summary', '無法取得建議')
+
     advice_html = f"""
     <div class="custom-card advice-card">
         <div class="card-header">🤖 AI 智慧理財與飲食建議</div>
         <div class="card-body">
-            <div class="advice-text">[AI]: {ai_advice.get('summary', '載入中...')}</div>
+            <div class="advice-text">{display_summary}</div>
         </div>
     </div>
     """
     st.markdown(advice_html, unsafe_allow_html=True)
 
     if st.checkbox("顯示建議理由", key="show_reason_fragment"):
+        display_reason = ai_advice.get('analysis', {}).get('reason') if 'analysis' in ai_advice else ai_advice.get('reason', '無詳細理由')
         st.markdown(f"""
         <div class="reasoning-box">
             💡 <b>詳細理由與分析：</b><br/>
-            {ai_advice.get('reason', '無詳細理由說明')}
+            {display_reason}
         </div>
         """, unsafe_allow_html=True)
 
@@ -275,9 +227,31 @@ def render_sidebar_stats(df_all):
     st.divider()
     
     st.header("👤 使用者設定")
-    user_name = st.text_input("使用者名稱", value="hogan", key="user_name")
+    st.write(f"當前使用者: **{st.session_state.get('user_name', '未登入')}**")
+    if st.button("切換使用者"):
+        del st.session_state.user_name
+        st.rerun()
 
 # --- 主程式執行區 ---
+
+# 0. 使用者登入邏輯
+if "user_name" not in st.session_state:
+    st.title("💰 Eatficiency 歡迎您")
+    users_df = get_users()
+    user_list = users_df['user_name'].tolist() if not users_df.empty else []
+    
+    with st.container(border=True):
+        selected_user = st.selectbox("選擇既有帳號", ["請選擇..."] + user_list)
+        new_user = st.text_input("或建立新帳號")
+        if st.button("開始使用", type="primary", use_container_width=True):
+            if new_user:
+                add_user(new_user)
+                st.session_state.user_name = new_user
+                st.rerun()
+            elif selected_user != "請選擇...":
+                st.session_state.user_name = selected_user
+                st.rerun()
+    st.stop()
 
 # 1. 讀取資料 (有快取)
 df_all = get_expenses()
@@ -289,16 +263,19 @@ with st.sidebar:
     menu = st.radio("選擇功能", ["📝 快速記帳 & AI建議", "📋 歷史消費紀錄"], index=0)
     st.divider()
     # 呼叫統計片段
-    render_sidebar_stats(df_all)
+    # 僅傳送該使用者的資料給側邊欄統計
+    df_user_only = df_all[df_all['user_name'] == st.session_state.user_name] if not df_all.empty else df_all
+    render_sidebar_stats(df_user_only)
 
 # 4. 全域變數偵測 (供主畫面使用)
 ua_string = st_javascript("navigator.userAgent")
 is_mobile = any(x in (ua_string or "").lower() for x in ["mobi", "android", "iphone"])
-user_name = st.session_state.get("user_name", "hogan")
+user_name = st.session_state.user_name
 
 if menu == "📝 快速記帳 & AI建議":
-    # 呼叫 AI 建議片段 (獨立載入)
-    render_ai_advice_section(df_all, GOOGLE_API_KEY)
+    # 根據 user 名稱篩選歷史紀錄傳遞給 AI 建議引擎
+    df_user_only = df_all[df_all['user_name'] == user_name] if not df_all.empty else df_all
+    render_ai_advice_section(df_user_only, GOOGLE_API_KEY)
     
     st.divider()
 
@@ -356,7 +333,8 @@ if menu == "📝 快速記帳 & AI建議":
         if text_input or uploaded_file:
             with st.spinner("AI 辨識中..."):
                 img_bytes = uploaded_file.getvalue() if uploaded_file else None
-                result = analyze_with_gemini(text_content=text_input, image_content=img_bytes)
+                ref_data = get_ref_data()
+                result = analyze_with_gemini(text_content=text_input, image_content=img_bytes, ref_data=ref_data)
                 if result:
                     st.session_state.result = result
                     # 辨識成功後自動關閉相機畫面
@@ -419,9 +397,11 @@ if menu == "📝 快速記帳 & AI建議":
 else:
     # --- 4. 歷史消費紀錄 ---
     st.subheader("📋 歷史消費紀錄")
-    if not df_all.empty:
+    # 僅顯示當前使用者的紀錄
+    df_user_history = df_all[df_all['user_name'] == user_name] if not df_all.empty else pd.DataFrame()
+    if not df_user_history.empty:
         cols_to_show = ["user_name", "date", "foodname", "amount", "category", "calories", "health_score", "advice"]
-        df_clean_display = df_all[cols_to_show] if all(col in df_all.columns for col in cols_to_show) else df_all
+        df_clean_display = df_user_history[cols_to_show] if all(col in df_user_history.columns for col in cols_to_show) else df_user_history
         st.dataframe(df_clean_display.iloc[::-1], use_container_width=True)
     else:
         st.info("尚無消費紀錄。")
